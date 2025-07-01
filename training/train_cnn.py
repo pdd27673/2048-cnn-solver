@@ -32,7 +32,8 @@ from pathlib import Path
 try:
     import tensorflow as tf
     from tensorflow import keras
-    import tensorflowjs as tfjs
+    
+    print(f"✅ TensorFlow {tf.__version__} loaded successfully")
     
     # Configure GPU memory growth (important for Colab)
     gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -40,22 +41,38 @@ try:
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"GPU acceleration enabled: {len(gpus)} GPU(s) detected")
-            print(f"GPU devices: {[gpu.name for gpu in gpus]}")
+            print(f"✅ GPU acceleration enabled: {len(gpus)} GPU(s) detected")
+            print(f"✅ GPU devices: {[gpu.name for gpu in gpus]}")
         except RuntimeError as e:
-            print(f"GPU setup error: {e}")
+            print(f"⚠️  GPU setup error: {e}")
     else:
-        print("No GPU detected - using CPU")
+        print("ℹ️  No GPU detected - using CPU")
     
     # Enable mixed precision for T4 (improves performance)
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.set_global_policy(policy)
-    print(f"Mixed precision policy: {policy.name}")
+    print(f"✅ Mixed precision policy: {policy.name}")
     
     TF_AVAILABLE = True
-except ImportError:
+    print("✅ TensorFlow initialization complete - neural network training enabled")
+    
+except ImportError as e:
     TF_AVAILABLE = False
-    print("TensorFlow not available. Running in limited mode.")
+    print(f"❌ TensorFlow import failed: {e}")
+    print("❌ Running in limited mode - only random moves will be used")
+except Exception as e:
+    TF_AVAILABLE = False
+    print(f"❌ TensorFlow setup failed: {e}")
+    print("❌ Running in limited mode - only random moves will be used")
+
+# TensorFlow.js import (optional, only for model conversion)
+try:
+    import tensorflowjs as tfjs
+    TFJS_AVAILABLE = True
+    print("✅ TensorFlow.js available for model conversion")
+except ImportError:
+    TFJS_AVAILABLE = False
+    print("ℹ️  TensorFlow.js not available - model conversion will be skipped")
 
 # Import our local modules
 from game_engine import Game2048Engine, encode_board_for_cnn
@@ -163,15 +180,8 @@ class CNNTrainer:
                 self.target_model = create_model() 
                 self.target_model.set_weights(self.model.get_weights())
                 
-                # Compile with mixed precision optimizer for T4
-                if colab_mode:
-                    optimizer = tf.keras.optimizers.Adam(lr)
-                    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
-                    self.model.compile(
-                        optimizer=optimizer,
-                        loss={'value_head': 'mse', 'policy_head': 'categorical_crossentropy'},
-                        metrics={'value_head': 'mae', 'policy_head': 'accuracy'}
-                    )
+                # Mixed precision is handled by global policy, use regular optimizer
+                self.model = compile_model(self.model, learning_rate=lr)
             else:
                 self.model = model
                 # Create a copy for the target network
@@ -358,35 +368,31 @@ class CNNTrainer:
                 # Get next state values from target model
                 next_values, _ = self.target_model(next_states, training=False)
                 
+                # Ensure all tensors are same dtype for mixed precision
+                rewards = tf.cast(rewards, current_values.dtype)
+                gamma_tensor = tf.cast(self.gamma, current_values.dtype)
+                next_values_squeezed = tf.cast(tf.squeeze(next_values), current_values.dtype)
+                
                 # Calculate target values using temporal difference learning
                 target_values = tf.where(
                     dones,
                     rewards,
-                    rewards + self.gamma * tf.squeeze(next_values)
+                    rewards + gamma_tensor * next_values_squeezed
                 )
                 target_values = tf.expand_dims(target_values, -1)
+                target_values = tf.cast(target_values, current_values.dtype)
                 
-                # Calculate losses
-                value_loss = tf.keras.losses.mse(target_values, current_values)
-                policy_loss = tf.keras.losses.sparse_categorical_crossentropy(
+                # Calculate losses (reduce to scalars)
+                value_loss = tf.reduce_mean(tf.keras.losses.mse(target_values, current_values))
+                policy_loss = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(
                     actions, current_policies, from_logits=False
-                )
+                ))
                 
-                # Combined loss with mixed precision scaling
+                # Combined loss (mixed precision handled automatically by global policy)
                 total_loss = value_loss + policy_loss
-                if self.colab_mode:
-                    scaled_loss = self.model.optimizer.get_scaled_loss(total_loss)
-                else:
-                    scaled_loss = total_loss
             
-            # Calculate gradients
-            if self.colab_mode:
-                gradients = tape.gradient(scaled_loss, self.model.trainable_variables)
-                gradients = self.model.optimizer.get_unscaled_gradients(gradients)
-            else:
-                gradients = tape.gradient(scaled_loss, self.model.trainable_variables)
-            
-            # Apply gradients
+            # Calculate and apply gradients
+            gradients = tape.gradient(total_loss, self.model.trainable_variables)
             self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
             
             return total_loss
@@ -433,7 +439,7 @@ class CNNTrainer:
                 json.dump(metadata, f, indent=2)
             
             # Save as TensorFlow.js format (if tfjs available and requested)
-            if save_tfjs:
+            if save_tfjs and TFJS_AVAILABLE:
                 try:
                     tfjs_dir = f"{filepath}_tfjs"
                     tfjs.converters.save_keras_model(
@@ -444,6 +450,8 @@ class CNNTrainer:
                     print(f"Model saved to {filepath}.keras, {tfjs_dir}/, and metadata")
                 except Exception as e:
                     print(f"Model saved to {filepath}.keras and metadata (TensorFlow.js conversion failed: {e})")
+            elif save_tfjs and not TFJS_AVAILABLE:
+                print(f"Model saved to {filepath}.keras and metadata (TensorFlow.js not available for conversion)")
             else:
                 print(f"Model saved to {filepath}.keras and metadata")
         else:
