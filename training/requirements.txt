@@ -1,0 +1,16 @@
+# Core ML dependencies - using compatible versions for Python 3.13
+tensorflow>=2.15.0
+tensorflowjs>=4.0.0
+numpy>=1.24.0
+
+# Data manipulation and visualization
+pandas
+matplotlib
+seaborn
+
+# Utilities
+tqdm
+scikit-learn
+
+# Optional: For better performance
+tensorflow-probability>=0.21.0 

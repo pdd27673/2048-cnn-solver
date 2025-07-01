@@ -26,4 +26,5 @@ node_modules/
 
 .cursor/
 .taskmaster/
+.claude/
 CLAUDE.md
