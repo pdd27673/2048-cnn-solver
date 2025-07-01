@@ -29,5 +29,26 @@ node_modules/
 .claude/
 CLAUDE.md
 
+# Python
 */venv/
 */__pycache__/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Training artifacts and models
+training/models/
+training/training_stats_*.json
+training/plots/
+training/logs/
+training/*.h5
+training/*.keras
+training/checkpoints/
+training/tensorboard_logs/
+training/training_log.txt
+training/nohup.out
+
+# TensorFlow.js model artifacts (until ready for deployment)
+frontend/public/model/
+*.tfjs/

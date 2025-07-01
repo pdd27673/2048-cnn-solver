@@ -20,6 +20,7 @@ seaborn
 # Utilities
 tqdm
 scikit-learn
+psutil  # For memory monitoring and system resource tracking
 
 # Optional: For better performance
 tensorflow-probability>=0.21.0 

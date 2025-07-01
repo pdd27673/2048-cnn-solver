@@ -129,23 +129,23 @@ class CNNTrainer:
                  gamma=0.99, epsilon_start=1.0, epsilon_final=0.05, 
                  epsilon_decay=300000, target_update=5000, colab_mode=False):
         """
-        Initialize the CNN trainer with hyperparameters optimized for T4 GPU
+        Initialize the CNN trainer with optimized settings for T4 GPU
         
         Args:
-            model: Optional pre-trained model. If None, creates a new one (when TF is available)
-            lr: Learning rate for the optimizer (0.001 good for T4)
-            batch_size: Batch size for training (128 optimal for T4)
-            memory_size: Maximum size of replay memory (200k for T4)
-            gamma: Discount factor for future rewards
-            epsilon_start: Initial exploration rate (1.0 = 100% random actions)
-            epsilon_final: Final exploration rate after decay (0.05 for better convergence)
-            epsilon_decay: Number of steps over which to decay epsilon
-            target_update: How often to update target network (5k for faster updates)
+            model: Pre-trained model to continue from (optional)
+            lr: Learning rate
+            batch_size: Training batch size (larger for T4)
+            memory_size: Replay memory size
+            gamma: Discount factor for Q-learning
+            epsilon_start: Starting exploration rate
+            epsilon_final: Final exploration rate
+            epsilon_decay: Steps to decay epsilon
+            target_update: Steps between target network updates
             colab_mode: Enable Colab-specific optimizations
         """
-        # Training hyperparameters
-        self.learning_rate = lr
+        # Core training parameters
         self.batch_size = batch_size
+        self.memory_size = memory_size
         self.gamma = gamma
         self.epsilon_start = epsilon_start
         self.epsilon_final = epsilon_final
@@ -153,42 +153,80 @@ class CNNTrainer:
         self.target_update = target_update
         self.colab_mode = colab_mode
         
-        # Performance tracking
-        self.training_start_time = time.time()
-        self.last_save_time = time.time()
-        self.batch_times = deque(maxlen=100)
-        self.losses = deque(maxlen=1000)
-        
-        # Memory buffer for experience replay
-        self.memory = deque(maxlen=memory_size)
-        self.memory_size = memory_size
-        
-        # Exploration parameters
-        self.epsilon = epsilon_start
+        # Training state
         self.steps_done = 0
+        self.epsilon = epsilon_start
+        self.memory = deque(maxlen=memory_size)
+        self.losses = []
+        self.batch_times = deque(maxlen=100)  # Track batch timing for performance
+        self.training_start_time = time.time()  # Track total training time
         
-        # Initialize model architecture if TensorFlow is available
-        self.model = None
-        self.target_model = None
-        
+        # Initialize model
         if TF_AVAILABLE:
             if model is None:
+                from model import create_model
                 self.model = create_model()
-                self.model = compile_model(self.model, learning_rate=lr)
-                
-                # Create target network with same architecture but different weights
-                self.target_model = create_model() 
-                self.target_model.set_weights(self.model.get_weights())
-                
-                # Mixed precision is handled by global policy, use regular optimizer
-                self.model = compile_model(self.model, learning_rate=lr)
+                self.model.compile(
+                    optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+                    loss=['mse', 'sparse_categorical_crossentropy'],
+                    loss_weights=[1.0, 1.0]
+                )
             else:
                 self.model = model
-                # Create a copy for the target network
-                self.target_model = keras.models.clone_model(model)
-                self.target_model.set_weights(model.get_weights())
+            
+            # Create target model (copy of main model)
+            self.target_model = tf.keras.models.clone_model(self.model)
+            self.target_model.set_weights(self.model.get_weights())
+            
+            print(f"✅ TensorFlow initialization complete - neural network training enabled")
         else:
-            print("Warning: TensorFlow not available. Model will not be created.")
+            self.model = None
+            self.target_model = None
+            print("ℹ️  TensorFlow not available - random move selection only")
+
+        # Define train_step as a method to avoid retracing
+        if TF_AVAILABLE and self.model:
+            @tf.function
+            def train_step_func(states, actions, rewards, next_states, dones):
+                with tf.GradientTape() as tape:
+                    # Get current predictions (value, policy)
+                    current_values, current_policies = self.model(states, training=True)
+                    
+                    # Get next state values from target model
+                    next_values, _ = self.target_model(next_states, training=False)
+                    
+                    # Ensure all tensors are same dtype for mixed precision
+                    rewards = tf.cast(rewards, current_values.dtype)
+                    gamma_tensor = tf.cast(self.gamma, current_values.dtype)
+                    next_values_squeezed = tf.cast(tf.squeeze(next_values), current_values.dtype)
+                    
+                    # Calculate target values using temporal difference learning
+                    target_values = tf.where(
+                        dones,
+                        rewards,
+                        rewards + gamma_tensor * next_values_squeezed
+                    )
+                    target_values = tf.expand_dims(target_values, -1)
+                    target_values = tf.cast(target_values, current_values.dtype)
+                    
+                    # Calculate losses (reduce to scalars)
+                    value_loss = tf.reduce_mean(tf.keras.losses.mse(target_values, current_values))
+                    policy_loss = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(
+                        actions, current_policies, from_logits=False
+                    ))
+                    
+                    # Combined loss (mixed precision handled automatically by global policy)
+                    total_loss = value_loss + policy_loss
+                
+                # Calculate and apply gradients
+                gradients = tape.gradient(total_loss, self.model.trainable_variables)
+                self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+                
+                return total_loss
+            
+            self._train_step_func = train_step_func
+        else:
+            self._train_step_func = None
     
     def get_epsilon_for_step(self, step):
         """
@@ -337,15 +375,30 @@ class CNNTrainer:
                 if loss is not None:
                     self.losses.append(loss)
         
+        # Calculate final stats before cleanup
         avg_confidence = np.mean(confidence_scores) if confidence_scores else 0.0
-        return game.score, game.get_max_tile(), len(episode_data), avg_confidence
+        final_score = game.score
+        final_max_tile = game.get_max_tile()
+        
+        # Cleanup after episode
+        try:
+            del episode_data, confidence_scores, state, next_state, prev_state
+        except:
+            pass
+        
+        # Force garbage collection periodically
+        if self.steps_done % 100 == 0:
+            import gc
+            gc.collect()
+        
+        return final_score, final_max_tile, move_count, avg_confidence
     
     def train_batch(self, batch_size=None):
         """
         Train on a batch from memory using dual-output model (value + policy)
-        Optimized for T4 GPU with efficient tensor operations
+        Optimized for T4 GPU with efficient tensor operations and memory cleanup
         """
-        if not TF_AVAILABLE or self.model is None:
+        if not TF_AVAILABLE or self.model is None or self._train_step_func is None:
             return 0.0
         
         if batch_size is None:
@@ -356,63 +409,44 @@ class CNNTrainer:
         
         # Sample a batch from memory
         batch_start = time.time()
-        states, actions, rewards, next_states, dones = self.sample_batch(batch_size)
+        batch_data = self.sample_batch(batch_size)
+        if batch_data is None:
+            return 0.0
         
-        # Use tf.function for faster execution on GPU
-        @tf.function
-        def train_step(states, actions, rewards, next_states, dones):
-            with tf.GradientTape() as tape:
-                # Get current predictions (value, policy)
-                current_values, current_policies = self.model(states, training=True)
-                
-                # Get next state values from target model
-                next_values, _ = self.target_model(next_states, training=False)
-                
-                # Ensure all tensors are same dtype for mixed precision
-                rewards = tf.cast(rewards, current_values.dtype)
-                gamma_tensor = tf.cast(self.gamma, current_values.dtype)
-                next_values_squeezed = tf.cast(tf.squeeze(next_values), current_values.dtype)
-                
-                # Calculate target values using temporal difference learning
-                target_values = tf.where(
-                    dones,
-                    rewards,
-                    rewards + gamma_tensor * next_values_squeezed
-                )
-                target_values = tf.expand_dims(target_values, -1)
-                target_values = tf.cast(target_values, current_values.dtype)
-                
-                # Calculate losses (reduce to scalars)
-                value_loss = tf.reduce_mean(tf.keras.losses.mse(target_values, current_values))
-                policy_loss = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(
-                    actions, current_policies, from_logits=False
-                ))
-                
-                # Combined loss (mixed precision handled automatically by global policy)
-                total_loss = value_loss + policy_loss
+        states, actions, rewards, next_states, dones = batch_data
+        
+        # Convert to tensors for tf.function with proper cleanup
+        try:
+            states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
+            actions_tensor = tf.convert_to_tensor(actions, dtype=tf.int64)
+            rewards_tensor = tf.convert_to_tensor(rewards, dtype=tf.float32)
+            next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
+            dones_tensor = tf.convert_to_tensor(dones, dtype=tf.bool)
             
-            # Calculate and apply gradients
-            gradients = tape.gradient(total_loss, self.model.trainable_variables)
-            self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+            # Execute training step
+            total_loss = self._train_step_func(states_tensor, actions_tensor, rewards_tensor, 
+                                             next_states_tensor, dones_tensor)
             
-            return total_loss
-        
-        # Convert to tensors for tf.function
-        states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
-        actions_tensor = tf.convert_to_tensor(actions, dtype=tf.int64)
-        rewards_tensor = tf.convert_to_tensor(rewards, dtype=tf.float32)
-        next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
-        dones_tensor = tf.convert_to_tensor(dones, dtype=tf.bool)
-        
-        # Execute training step
-        total_loss = train_step(states_tensor, actions_tensor, rewards_tensor, 
-                              next_states_tensor, dones_tensor)
-        
-        # Track timing
-        batch_time = time.time() - batch_start
-        self.batch_times.append(batch_time)
-        
-        return float(total_loss.numpy())
+            # Convert loss to Python float and clean up tensors
+            loss_value = float(total_loss.numpy())
+            
+            # Explicit cleanup
+            del states_tensor, actions_tensor, rewards_tensor, next_states_tensor, dones_tensor, total_loss
+            
+            # Track timing for performance monitoring
+            batch_time = time.time() - batch_start
+            if hasattr(self, 'batch_times'):
+                self.batch_times.append(batch_time)
+            
+            return loss_value
+            
+        except Exception as e:
+            print(f"Training batch failed: {e}")
+            return 0.0
+        finally:
+            # Force garbage collection after training
+            import gc
+            gc.collect()
     
     def save_model(self, filepath, save_tfjs=True):
         """Save the trained model with Colab optimizations"""
