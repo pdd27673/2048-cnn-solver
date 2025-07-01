@@ -6,12 +6,19 @@ import AIControls from './AIControls';
 import AIVisualizer from './AIVisualizer';
 import StatsPanel from './StatsPanel';
 import { GameEngine } from '../lib/game-engine';
+import { aiModel, ModelState } from '../lib/ai/cnn-model';
 
 interface GameStats {
   movesPlayed: number;
   maxTile: number;
   aiAccuracy: number;
   totalGames: number;
+}
+
+interface AIModelStatus {
+  state: ModelState;
+  error: string | null;
+  lastPrediction: any;
 }
 
 export default function Game() {
@@ -26,6 +33,12 @@ export default function Game() {
     maxTile: 2,
     aiAccuracy: 0,
     totalGames: 0
+  });
+  
+  const [modelStatus, setModelStatus] = useState<AIModelStatus>({
+    state: ModelState.UNLOADED,
+    error: null,
+    lastPrediction: null
   });
 
   const updateGameState = useCallback(() => {
@@ -47,6 +60,43 @@ export default function Game() {
     updateGameState();
   }, [updateGameState]);
 
+  // Load AI model on component mount
+  useEffect(() => {
+    const loadModel = async () => {
+      console.log('🤖 Attempting to load AI model...');
+      setModelStatus(prev => ({ ...prev, state: ModelState.LOADING }));
+      
+      try {
+        const result = await aiModel.loadModel();
+        
+        if (result.success) {
+          console.log('✅ AI model loaded successfully:', result.modelInfo);
+          setModelStatus({
+            state: ModelState.LOADED,
+            error: null,
+            lastPrediction: null
+          });
+        } else {
+          console.log('❌ Failed to load AI model:', result.error);
+          setModelStatus({
+            state: ModelState.ERROR,
+            error: result.error || 'Unknown error',
+            lastPrediction: null
+          });
+        }
+      } catch (error) {
+        console.error('❌ Error loading AI model:', error);
+        setModelStatus({
+          state: ModelState.ERROR,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          lastPrediction: null
+        });
+      }
+    };
+
+    loadModel();
+  }, []);
+
   const resetGame = () => {
     if (!gameEngineRef.current) return;
     
@@ -57,6 +107,45 @@ export default function Game() {
       totalGames: prev.totalGames + 1,
       movesPlayed: 0
     }));
+  };
+
+  // Test AI prediction with current board
+  const testAIPrediction = async () => {
+    if (!gameEngineRef.current || modelStatus.state !== ModelState.LOADED) {
+      console.log('❌ Cannot test AI: Model not loaded or game not ready');
+      return;
+    }
+
+    try {
+      const gameState = gameEngineRef.current.getGameState();
+      const validMoves = gameEngineRef.current.getValidMoves();
+      
+      console.log('🧠 Testing AI prediction...');
+      console.log('Current board:', gameState.board);
+      console.log('Valid moves:', validMoves);
+      
+      const prediction = await aiModel.predictMove(gameState.board, validMoves);
+      
+      console.log('🎯 AI Prediction:', {
+        move: prediction.move,
+        moveName: ['Up', 'Right', 'Down', 'Left'][prediction.move],
+        confidence: `${(prediction.confidence * 100).toFixed(1)}%`,
+        value: prediction.value.toFixed(3),
+        policy: prediction.policy.map(p => `${(p * 100).toFixed(1)}%`)
+      });
+
+      setModelStatus(prev => ({
+        ...prev,
+        lastPrediction: prediction
+      }));
+
+    } catch (error) {
+      console.error('❌ AI prediction error:', error);
+      setModelStatus(prev => ({
+        ...prev,
+        error: error instanceof Error ? error.message : 'Prediction failed'
+      }));
+    }
   };
 
   const makeMove = useCallback((direction: number) => {
@@ -111,7 +200,7 @@ export default function Game() {
           <div className="lg:col-span-2">
             <Board board={board} score={score} />
             
-            <div className="mt-4 flex gap-4 justify-center">
+            <div className="mt-4 flex gap-4 justify-center flex-wrap">
               <button
                 onClick={resetGame}
                 className="px-6 py-2 bg-blue-600 rounded-lg hover:bg-blue-700 transition"
@@ -128,6 +217,35 @@ export default function Game() {
               >
                 {aiEnabled ? 'Stop AI' : 'Start AI'}
               </button>
+              <button
+                onClick={testAIPrediction}
+                disabled={modelStatus.state !== ModelState.LOADED}
+                className={`px-6 py-2 rounded-lg transition ${
+                  modelStatus.state === ModelState.LOADED
+                    ? 'bg-purple-600 hover:bg-purple-700'
+                    : 'bg-gray-600 cursor-not-allowed'
+                }`}
+              >
+                Test AI Prediction
+              </button>
+            </div>
+
+            {/* AI Model Status */}
+            <div className="mt-4 text-center">
+              <div className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-700">
+                <span className="text-sm font-medium">AI Model:</span>
+                <span className={`text-sm font-bold ${
+                  modelStatus.state === ModelState.LOADED ? 'text-green-400' :
+                  modelStatus.state === ModelState.LOADING ? 'text-yellow-400' :
+                  modelStatus.state === ModelState.ERROR ? 'text-red-400' :
+                  'text-gray-400'
+                }`}>
+                  {modelStatus.state.toUpperCase()}
+                </span>
+                {modelStatus.error && (
+                  <span className="text-xs text-red-300">({modelStatus.error})</span>
+                )}
+              </div>
             </div>
 
             {gameOver && (
