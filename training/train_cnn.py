@@ -2,7 +2,11 @@
 CNN Training Script for 2048 AI
 
 This script will train a CNN model to play 2048 using self-play and reinforcement learning.
-Currently using placeholder structure due to TensorFlow Python 3.13 compatibility issues.
+
+IMPORTANT: Always run this script in a Python virtual environment!
+Before running, ensure you have activated the venv:
+    source venv/bin/activate  # On macOS/Linux
+    pip install -r requirements.txt
 """
 
 import numpy as np
@@ -10,83 +14,181 @@ import random
 from collections import deque
 import json
 import os
+import sys
 from datetime import datetime
+from typing import List, Tuple, Dict, Any, Union
 
 # Note: TensorFlow import will be added when compatibility is resolved
-# import tensorflow as tf
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    import tensorflowjs as tfjs
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+    print("TensorFlow not available. Running in limited mode.")
+
+# Import our local modules
+from game_engine import Game2048Engine, encode_board_for_cnn
+from model import Game2048CNN, create_model, compile_model
 
 class Game2048:
     """
     Python implementation of 2048 game for training
     """
     def __init__(self):
-        self.board = np.zeros((4, 4), dtype=int)
-        self.score = 0
-        self.add_random_tile()
-        self.add_random_tile()
+        self.game_engine = Game2048Engine()
     
     def add_random_tile(self):
         """Add a random 2 or 4 tile to an empty position"""
-        empty_cells = [(i, j) for i in range(4) for j in range(4) if self.board[i][j] == 0]
-        if empty_cells:
-            row, col = random.choice(empty_cells)
-            self.board[row, col] = 2 if random.random() < 0.9 else 4
-            return True
-        return False
+        return self.game_engine._add_random_tile()
     
     def get_valid_moves(self):
         """Get list of valid moves (0=up, 1=right, 2=down, 3=left)"""
-        valid_moves = []
-        original_board = self.board.copy()
-        original_score = self.score
-        
-        for move in range(4):
-            if self.make_move(move):
-                valid_moves.append(move)
-            self.board = original_board.copy()
-            self.score = original_score
-        
-        return valid_moves
+        return self.game_engine.get_valid_moves()
     
     def make_move(self, direction):
         """Make a move in the specified direction"""
-        # Placeholder implementation
-        # Will be completed in task 2 (Implement Core Game Engine)
-        return False
+        return self.game_engine.move(direction)
     
     def is_game_over(self):
         """Check if the game is over"""
-        return len(self.get_valid_moves()) == 0
+        return self.game_engine.is_game_over()
     
     def get_max_tile(self):
         """Get the maximum tile value on the board"""
-        return np.max(self.board)
+        return self.game_engine.get_max_tile()
+    
+    @property
+    def board(self):
+        return self.game_engine.board
+    
+    @property
+    def score(self):
+        return self.game_engine.score
 
 def encode_board(board):
     """
     Encode board as 4x4x16 tensor (one-hot encoding)
     Each channel represents a power of 2 (2^1 to 2^16)
     """
-    encoded = np.zeros((4, 4, 16))
-    for i in range(4):
-        for j in range(4):
-            if board[i, j] > 0:
-                power = int(np.log2(board[i, j])) - 1
-                if 0 <= power < 16:
-                    encoded[i, j, power] = 1
-    return encoded
+    return encode_board_for_cnn(board)
 
 class CNNTrainer:
     """
-    CNN Trainer class for 2048 AI
-    Placeholder structure until TensorFlow compatibility is resolved
+    CNN Trainer class for 2048 AI with reinforcement learning
     """
-    def __init__(self, lr=0.001):
-        self.learning_rate = lr
-        self.memory = deque(maxlen=100000)
-        self.epsilon = 0.1  # Exploration rate
-        self.model = None  # Will be initialized with TensorFlow
+    def __init__(self, model=None, lr=0.001, batch_size=32, memory_size=100000, 
+                 gamma=0.99, epsilon_start=1.0, epsilon_final=0.1, 
+                 epsilon_decay=200000, target_update=10000):
+        """
+        Initialize the CNN trainer with hyperparameters
         
+        Args:
+            model: Optional pre-trained model. If None, creates a new one (when TF is available)
+            lr: Learning rate for the optimizer
+            batch_size: Batch size for training
+            memory_size: Maximum size of replay memory
+            gamma: Discount factor for future rewards
+            epsilon_start: Initial exploration rate (1.0 = 100% random actions)
+            epsilon_final: Final exploration rate after decay
+            epsilon_decay: Number of steps over which to decay epsilon
+            target_update: How often to update target network (in steps)
+        """
+        # Training hyperparameters
+        self.learning_rate = lr
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.epsilon_start = epsilon_start
+        self.epsilon_final = epsilon_final
+        self.epsilon_decay = epsilon_decay
+        self.target_update = target_update
+        
+        # Memory buffer for experience replay
+        self.memory = deque(maxlen=memory_size)
+        self.memory_size = memory_size
+        
+        # Exploration parameters
+        self.epsilon = epsilon_start
+        self.steps_done = 0
+        
+        # Initialize model architecture if TensorFlow is available
+        self.model = None
+        self.target_model = None
+        
+        if TF_AVAILABLE:
+            if model is None:
+                self.model = create_model()
+                self.model = compile_model(self.model, learning_rate=lr)
+                
+                # Create target network with same architecture but different weights
+                self.target_model = create_model() 
+                self.target_model.set_weights(self.model.get_weights())
+            else:
+                self.model = model
+                # Create a copy for the target network
+                self.target_model = keras.models.clone_model(model)
+                self.target_model.set_weights(model.get_weights())
+        else:
+            print("Warning: TensorFlow not available. Model will not be created.")
+    
+    def get_epsilon_for_step(self, step):
+        """
+        Get epsilon value (exploration rate) for the current step
+        
+        Args:
+            step: Current training step
+            
+        Returns:
+            float: Exploration rate (epsilon)
+        """
+        # Linear epsilon decay schedule
+        if step >= self.epsilon_decay:
+            return self.epsilon_final
+        else:
+            return self.epsilon_final + (self.epsilon_start - self.epsilon_final) * \
+                   (1 - step / self.epsilon_decay)
+    
+    def store_experience(self, state, action, reward, next_state, done):
+        """
+        Store a transition in the replay memory
+        
+        Args:
+            state: Current state (encoded board)
+            action: Action taken (0-3)
+            reward: Reward received
+            next_state: Next state after taking action
+            done: Whether the game ended after this action
+        """
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def sample_batch(self, batch_size=None):
+        """
+        Sample a random batch from replay memory
+        
+        Args:
+            batch_size: Size of batch to sample (defaults to self.batch_size)
+            
+        Returns:
+            tuple: Batch of experiences (states, actions, rewards, next_states, dones)
+        """
+        if batch_size is None:
+            batch_size = self.batch_size
+            
+        if len(self.memory) < batch_size:
+            return None
+        
+        batch = random.sample(self.memory, batch_size)
+        
+        # Separate into component arrays
+        states = np.array([experience[0] for experience in batch])
+        actions = np.array([experience[1] for experience in batch])
+        rewards = np.array([experience[2] for experience in batch])
+        next_states = np.array([experience[3] for experience in batch])
+        dones = np.array([experience[4] for experience in batch])
+        
+        return states, actions, rewards, next_states, dones
+    
     def self_play_episode(self):
         """
         Play one game episode with epsilon-greedy exploration
@@ -102,6 +204,9 @@ class CNNTrainer:
             if not valid_moves:
                 break
                 
+            # Update epsilon for current step
+            self.epsilon = self.get_epsilon_for_step(self.steps_done)
+            
             # Epsilon-greedy action selection
             if random.random() < self.epsilon:
                 action = random.choice(valid_moves)

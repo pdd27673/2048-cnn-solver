@@ -1,4 +1,13 @@
-# Core ML dependencies - using compatible versions for Python 3.13
+# 2048 CNN Training Dependencies
+# IMPORTANT: Install these in a virtual environment!
+# 
+# Setup:
+#   python3 -m venv venv
+#   source venv/bin/activate  # On macOS/Linux
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# Core ML dependencies - using compatible versions for Python 3.8+
 tensorflow>=2.15.0
 tensorflowjs>=4.0.0
 numpy>=1.24.0
